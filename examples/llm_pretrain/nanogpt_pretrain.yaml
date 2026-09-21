@@ -12,7 +12,10 @@ step_scheduler:
   local_batch_size: 2
   ckpt_every_steps: 2000
   num_epochs: 1
-  max_steps: 9500
+  max_steps: 10
+
+checkpoint:
+  checkpoint_dir: /tmp/automodel-nanogpt-smoke/checkpoints
 
 dist_env:
   backend: nccl
@@ -26,7 +29,7 @@ model:
   n_positions: 2048   # context length
   n_embd: 768         # hidden size
   n_layer: 12         # number of transformer blocks
-  n_head: 12          # attention heads
+  n_head: 12          # attention he`ads
   bos_token_id: 50256
   eos_token_id: 50256
 
@@ -45,11 +48,11 @@ model:
 #     eos_token_id: 50256
 
 # Dataset
-# Point this to the location where your *.bin shards live.
-# The pattern below matches the sample shards included in *modded-nanogpt*.
+# Local FineWeb smoke-test sample prepared with tools/nanogpt_data_processor.py.
+# Regenerate the sample if /tmp is cleared, or point this to persistent token shards.
 dataset:
   _target_: nemo_automodel.components.datasets.llm.nanogpt_dataset.NanogptDataset
-  file_pattern: "modded-nanogpt/data/fineweb_10BT_max_500M/fineweb_train_*.bin"
+  file_pattern: "/tmp/automodel-nanogpt-smoke/fineweb_max_tokens_1M/dataset.bin"
   seq_len: 1024
   shuffle_files: true
   align_to_bos: false
