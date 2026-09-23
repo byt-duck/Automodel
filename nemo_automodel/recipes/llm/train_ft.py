@@ -1094,68 +1094,96 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         self.timestamp = time.perf_counter()
 
         pbar = self._make_progress_bar()
+        trace_dir = "/home/palshraya/Automodel/traces"
+        rank = torch.distributed.get_rank()
         try:
-            for epoch in self.step_scheduler.epochs:
-                self.step_scheduler.set_epoch(epoch)
-                # The step scheduler yields a list of batches with the following properties:
-                # 1. len(batches) == grad_acc_steps
-                # 2. len(batches[0]) == batch_size
-                for batches in self.step_scheduler:
-                    # If QAT delayed fake-quant is configured, enable after threshold
-                    self._enable_qat_if_delayed(self.step_scheduler.step)
-                    train_log_data = self._run_train_optim_step(batches, self.max_grad_norm)
-                    # Capture outside the microbatch loop and only after the
-                    # eager optimizer step has completed. This leaves no
-                    # pending checkpoint recomputation or GA backward work.
-                    if self.partial_cuda_graph_manager is not None and self._partial_cuda_graph_capture_pending:
-                        self.partial_cuda_graph_manager.capture()
-                        self._partial_cuda_graph_capture_pending = False
-                    # Collect MoE load balance metrics (all ranks participate in all-reduce)
-                    self._collect_moe_load_balance()
-                    # log
-                    self.log_train_metrics(train_log_data)
-                    self._update_progress_bar(pbar, train_log_data.metrics)
+            scheduler = torch.profiler.schedule(wait=1, warmup=5, active=3, repeat=1)
+            with torch.profiler.profile(
+                activities=[
+                    torch.profiler.ProfilerActivity.CPU,
+                    torch.profiler.ProfilerActivity.CUDA,
+                ],
+                schedule=scheduler,
+                record_shapes=False,
+                profile_memory=False,
+                with_stack=False,
+                #on_trace_ready=on_trace_ready,
+            ) as prof:
+                for epoch in self.step_scheduler.epochs:
+                    self.step_scheduler.set_epoch(epoch)
+                    # The step scheduler yields a list of batches with the following properties:
+                    # 1. len(batches) == grad_acc_steps
+                    # 2. len(batches[0]) == batch_size
+                    for batches in self.step_scheduler:
+                        # If QAT delayed fake-quant is configured, enable after threshold
+                        self._enable_qat_if_delayed(self.step_scheduler.step)
 
-                    # Run validation every val_every_steps
-                    val_losses = {}
-                    if self.step_scheduler.is_val_step:
-                        total_validation_tokens = 0
-                        for val_name, val_dataloader in self.val_dataloaders.items():
-                            val_log_data = self._run_validation_epoch(val_dataloader)
-                            val_losses[val_name] = val_log_data.metrics["val_loss"]
-                            total_validation_tokens += val_log_data.metrics["num_label_tokens"]
-                            self.log_val_metrics(val_name, val_log_data, self.metric_logger_valid[val_name])
-                        if self.domain_mixture is not None and val_losses:
-                            weighted_loss = self.domain_mixture.weighted_validation_loss(val_losses)
-                            val_losses[WEIGHTED_AGGREGATE_NAME] = weighted_loss
-                            weighted_log_data = MetricsSample(
-                                step=self.step_scheduler.step,
-                                epoch=self.step_scheduler.epoch,
-                                metrics={
-                                    "val_loss": weighted_loss,
-                                    "lr": self.optimizer[0].param_groups[0]["lr"],
-                                    "num_label_tokens": total_validation_tokens,
-                                    "mem": torch.cuda.max_memory_allocated() / 1024**3,
-                                },
-                            )
-                            self.log_val_metrics(
-                                WEIGHTED_AGGREGATE_NAME,
-                                weighted_log_data,
-                                self.metric_logger_valid[WEIGHTED_AGGREGATE_NAME],
-                            )
-                        for mp in self.model_parts:
-                            mp.train()
+                        with torch.profiler.record_function("training step"):
+                            train_log_data = self._run_train_optim_step(batches, self.max_grad_norm)
+                        # Capture outside the microbatch loop and only after the
+                        # eager optimizer step has completed. This leaves no
+                        # pending checkpoint recomputation or GA backward work.
+                        if self.partial_cuda_graph_manager is not None and self._partial_cuda_graph_capture_pending:
+                            self.partial_cuda_graph_manager.capture()
+                            self._partial_cuda_graph_capture_pending = False
+                        # Collect MoE load balance metrics (all ranks participate in all-reduce)
+                        self._collect_moe_load_balance()
+                        # log
+                        self.log_train_metrics(train_log_data)
+                        self._update_progress_bar(pbar, train_log_data.metrics)
 
-                    # Save the checkpoint every ckpt_every_steps
-                    if self.step_scheduler.is_ckpt_step:
-                        self.save_checkpoint(
-                            epoch,
-                            self.step_scheduler.step,
-                            train_log_data.metrics["loss"],
-                            val_losses,
-                            best_metric_key=self.best_metric_key,
-                        )
-                    self._maybe_collect_garbage()
+                        prof.step()
+
+                        # Run validation every val_every_steps
+                        val_losses = {}
+                        if self.step_scheduler.is_val_step:
+                            total_validation_tokens = 0
+                            for val_name, val_dataloader in self.val_dataloaders.items():
+                                val_log_data = self._run_validation_epoch(val_dataloader)
+                                val_losses[val_name] = val_log_data.metrics["val_loss"]
+                                total_validation_tokens += val_log_data.metrics["num_label_tokens"]
+                                self.log_val_metrics(val_name, val_log_data, self.metric_logger_valid[val_name])
+                            if self.domain_mixture is not None and val_losses:
+                                weighted_loss = self.domain_mixture.weighted_validation_loss(val_losses)
+                                val_losses[WEIGHTED_AGGREGATE_NAME] = weighted_loss
+                                weighted_log_data = MetricsSample(
+                                    step=self.step_scheduler.step,
+                                    epoch=self.step_scheduler.epoch,
+                                    metrics={
+                                        "val_loss": weighted_loss,
+                                        "lr": self.optimizer[0].param_groups[0]["lr"],
+                                        "num_label_tokens": total_validation_tokens,
+                                        "mem": torch.cuda.max_memory_allocated() / 1024**3,
+                                    },
+                                )
+                                self.log_val_metrics(
+                                    WEIGHTED_AGGREGATE_NAME,
+                                    weighted_log_data,
+                                    self.metric_logger_valid[WEIGHTED_AGGREGATE_NAME],
+                                )
+                            for mp in self.model_parts:
+                                mp.train()
+
+                        # Save the checkpoint every ckpt_every_steps
+                        if self.step_scheduler.is_ckpt_step:
+                            self.save_checkpoint(
+                                epoch,
+                                self.step_scheduler.step,
+                                train_log_data.metrics["loss"],
+                                val_losses,
+                                best_metric_key=self.best_metric_key,
+                            )
+                        self._maybe_collect_garbage()
+            
+            torch.cuda.synchronize()
+            if rank == 0:
+                trace_path = f"{trace_dir}/nemo-hellaswag-ft.json"
+                table_path = f"{trace_dir}/nemo-hellaswag-ft.txt"
+                prof.export_chrome_trace(trace_path)
+                with open(table_path, "w") as f:
+                    f.write(prof.key_averages().table(sort_by="cuda_time_total", row_limit=15))
+                
+
         finally:
             if pbar is not None:
                 pbar.close()
