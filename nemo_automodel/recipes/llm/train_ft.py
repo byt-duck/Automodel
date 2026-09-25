@@ -532,6 +532,11 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         self.partial_cuda_graph_manager = None
         self._partial_cuda_graph_capture_pending = False
 
+    # for debugging -> make sure to only call after default PG init
+    def printf(self, string):
+        if self.RANK == 0:
+            print(string)
+
     # ------------------ build phase ------------------
     def _create_distributed_setup(self) -> DistributedSetup:
         """Create the distributed setup used by this recipe rank."""
@@ -554,6 +559,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             backend=self.cfg.get("dist_env", {}).get("backend", "nccl"),
             timeout_minutes=self.cfg.get("dist_env", {}).get("timeout_minutes", 1),
         )
+        self.RANK = torch.distributed.get_rank()
         # setups logging and adds the rankfilter to logging
         setup_logging()
 
@@ -703,6 +709,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         # Build components
         self.peft_config = None
         if self.cfg.get("peft", None) is not None:
+            self.printf("we are doing peft")
             self.peft_config = self.cfg.peft.instantiate()
 
         # Checkpoint config (model-derived fields are filled in by RecipeConfig)
@@ -1095,7 +1102,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
 
         pbar = self._make_progress_bar()
         trace_dir = "/home/palshraya/Automodel/traces"
-        rank = torch.distributed.get_rank()
+        rank = self.RANK
         try:
             scheduler = torch.profiler.schedule(wait=1, warmup=5, active=3, repeat=1)
             with torch.profiler.profile(
@@ -1175,13 +1182,13 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                             )
                         self._maybe_collect_garbage()
             
-            torch.cuda.synchronize()
-            if rank == 0:
-                trace_path = f"{trace_dir}/nemo-hellaswag-ft.json"
-                table_path = f"{trace_dir}/nemo-hellaswag-ft.txt"
-                prof.export_chrome_trace(trace_path)
-                with open(table_path, "w") as f:
-                    f.write(prof.key_averages().table(sort_by="cuda_time_total", row_limit=15))
+            # torch.cuda.synchronize()
+            # if rank == 0:
+            #     trace_path = f"{trace_dir}/nemo-hellaswag-ft.json"
+            #     table_path = f"{trace_dir}/nemo-hellaswag-ft.txt"
+            #     prof.export_chrome_trace(trace_path)
+            #     with open(table_path, "w") as f:
+            #         f.write(prof.key_averages().table(sort_by="cuda_time_total", row_limit=15))
                 
 
         finally:
@@ -1278,6 +1285,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         fp8_ctx = self.te_fp8.maybe_te_autocast() if self.te_fp8 is not None else nullcontext()
 
         if self.pp_enabled:
+            self.printf("pp is enabled")
             with train_ctx(), fp8_ctx:
                 losses = [] if self.pp.info.has_last_stage else None
                 if self.pp.info.has_last_stage:
@@ -1340,13 +1348,14 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                 batch = filter_forward_kwargs(model, batch)
                 if isinstance(self.loss_fn, FusedLinearCrossEntropy):
                     # use num_logits_to_keep to avoid full logits matrix in memory
-                    out = model(logits_to_keep=1, **batch)
                     if "hidden_states" not in out:
                         raise ValueError(
                             "FusedLinearCrossEntropy requires the model to output hidden states. Set `model.output_hidden_states=True` in the config."
                         )
                 else:
-                    out = model(**batch)
+                    # nemotron peft -> should be using masked ce
+                    with torch.profiler.record_function("model fwd pass"):
+                        out = model(**batch)
 
                 # Gather the LM head once and share it across the main loss and
                 # all MTP depths (FusedLinearCrossEntropy path) to avoid redundant
@@ -1364,46 +1373,49 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                 # loss paths that predate them keep their original signature.
                 if loss_weights is not None:
                     loss_distributed_kwargs["loss_weights"] = loss_weights
-                local_loss = calculate_loss(
-                    self.loss_fn,
-                    logits=getattr(out, "logits", out),
-                    labels=labels,
-                    model=model,
-                    hidden_states=get_final_hidden_states(out),
-                    lm_weight=shared_lm_weight,
-                    num_label_tokens=num_label_tokens,
-                    **loss_distributed_kwargs,
-                )
-                mtp_per_depth_h = getattr(out, "mtp_per_depth_h", None)
-                mtp_per_depth_logits = getattr(out, "mtp_per_depth_logits", None)
-                if mtp_per_depth_h is not None or mtp_per_depth_logits is not None:
-                    mtp_cfg = self.cfg.mtp
-                    if self._get_cp_group_size() > 1 and mtp_per_depth_targets is None:
-                        raise NotImplementedError(
-                            f"{type(model).__name__} produced MTP outputs under context parallelism "
-                            "without globally prepared targets"
-                        )
-                    scaling_factor = (
-                        mtp_cfg.scaling_factor if mtp_cfg.scaling_factor is not None else out.mtp_loss_scaling_factor
-                    )
-                    local_loss = local_loss + calculate_mtp_loss(
+                with torch.profiler.record_function("loss calculation"):
+                    local_loss = calculate_loss(
                         self.loss_fn,
-                        mtp_per_depth_h=mtp_per_depth_h,
-                        mtp_per_depth_logits=mtp_per_depth_logits,
-                        mtp_per_depth_targets=mtp_per_depth_targets,
+                        logits=getattr(out, "logits", out),
                         labels=labels,
                         model=model,
-                        scaling_factor=scaling_factor,
-                        num_label_tokens=num_label_tokens,
-                        ignore_index=ignore_index,
-                        # mask cross-boundary MTP label rolls in THD packing (matches the PP path)
-                        cu_seqlens=None if mtp_per_depth_targets is not None else batch.get("cu_seqlens"),
+                        hidden_states=get_final_hidden_states(out),
                         lm_weight=shared_lm_weight,
+                        num_label_tokens=num_label_tokens,
                         **loss_distributed_kwargs,
                     )
+                    mtp_per_depth_h = getattr(out, "mtp_per_depth_h", None)
+                    mtp_per_depth_logits = getattr(out, "mtp_per_depth_logits", None)
+                    if mtp_per_depth_h is not None or mtp_per_depth_logits is not None:
+                        mtp_cfg = self.cfg.mtp
+                        if self._get_cp_group_size() > 1 and mtp_per_depth_targets is None:
+                            raise NotImplementedError(
+                                f"{type(model).__name__} produced MTP outputs under context parallelism "
+                                "without globally prepared targets"
+                            )
+                        scaling_factor = (
+                            mtp_cfg.scaling_factor if mtp_cfg.scaling_factor is not None else out.mtp_loss_scaling_factor
+                        )
+                        local_loss = local_loss + calculate_mtp_loss(
+                            self.loss_fn,
+                            mtp_per_depth_h=mtp_per_depth_h,
+                            mtp_per_depth_logits=mtp_per_depth_logits,
+                            mtp_per_depth_targets=mtp_per_depth_targets,
+                            labels=labels,
+                            model=model,
+                            scaling_factor=scaling_factor,
+                            num_label_tokens=num_label_tokens,
+                            ignore_index=ignore_index,
+                            # mask cross-boundary MTP label rolls in THD packing (matches the PP path)
+                            cu_seqlens=None if mtp_per_depth_targets is not None else batch.get("cu_seqlens"),
+                            lm_weight=shared_lm_weight,
+                            **loss_distributed_kwargs,
+                        )
                 loss_buffer.append(local_loss.clone().detach())
+
                 if is_train:
-                    (local_loss * self._get_dp_group_size(include_cp=True)).backward()
+                    with torch.profiler.record_function("bwd pass"):
+                        (local_loss * self._get_dp_group_size(include_cp=True)).backward()
 
     def _broadcast_from_last_pp_stage(self, tensor: torch.Tensor) -> torch.Tensor:
         """Broadcast a PP last-stage scalar to the other ranks in its pipeline group."""
@@ -1424,7 +1436,8 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         num_label_tokens = torch.tensor(
             sum(_count_label_tokens(batch["labels"], ignore_index) for batch in batches), dtype=torch.long
         )
-        num_label_tokens = self._dp_allreduce(num_label_tokens).item()
+        with torch.profiler.record_function("total num label tokens"):
+            num_label_tokens = self._dp_allreduce(num_label_tokens).item() # total num label tokens cross-batch
 
         domain_label_counts = None
         if self.domain_mixture is not None:
@@ -1434,31 +1447,35 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             # all ranks abort together, on the same step, with a real traceback.
             # This also validates every microbatch up front, letting the
             # per-microbatch weighting skip its bounds-check syncs.
+
+            # (duck) meaning? if any rank errors -> would just raise and exit -> every other rank would hang on all-reduce until NCCL watchdog fires
+            # so we wrap in try-except, and contribute 1/0 to 'failed' tensor -> after all-reduce if any rank raise 1 -> exit
             ignore_index = getattr(self.loss_fn, "ignore_index", -100)
             domain_label_counts = torch.zeros(len(self.domain_mixture.names), dtype=torch.long)
             local_error = ""
-            try:
-                for batch in batches:
-                    dataset_ids = batch.get("dataset_id")
-                    if dataset_ids is None:
-                        raise ValueError(
-                            "domain_mixture requires each training batch to contain dataset_id; "
-                            "use a blended dataset that emits one ID per sample"
-                        )
-                    domain_label_counts += self.domain_mixture.label_counts(
-                        dataset_ids, batch["labels"], ignore_index=ignore_index
-                    ).cpu()
-            except (TypeError, ValueError) as exc:
-                local_error = f"{type(exc).__name__}: {exc}"
-                domain_label_counts.zero_()
-            failed = self._dp_allreduce(torch.tensor(1 if local_error else 0, dtype=torch.long)).item()
-            if failed:
-                raise ValueError(
-                    local_error
-                    or "domain_mixture rejected the dataset_id of another data-parallel rank's batch; "
-                    "see that rank's log for the specific error"
-                )
-            domain_label_counts = self._dp_allreduce(domain_label_counts)
+            with torch.profiler.record_function("verifying dataset"):
+                try:
+                    for batch in batches:
+                        dataset_ids = batch.get("dataset_id")
+                        if dataset_ids is None:
+                            raise ValueError(
+                                "domain_mixture requires each training batch to contain dataset_id; "
+                                "use a blended dataset that emits one ID per sample"
+                            )
+                        domain_label_counts += self.domain_mixture.label_counts(
+                            dataset_ids, batch["labels"], ignore_index=ignore_index
+                        ).cpu()
+                except (TypeError, ValueError) as exc:
+                    local_error = f"{type(exc).__name__}: {exc}"
+                    domain_label_counts.zero_()
+                failed = self._dp_allreduce(torch.tensor(1 if local_error else 0, dtype=torch.long)).item()
+                if failed:
+                    raise ValueError(
+                        local_error
+                        or "domain_mixture rejected the dataset_id of another data-parallel rank's batch; "
+                        "see that rank's log for the specific error"
+                    )
+                domain_label_counts = self._dp_allreduce(domain_label_counts)
 
         num_batches = len(batches)
         self._set_moe_aux_loss_backward_scale(num_batches=num_batches, num_label_tokens=num_label_tokens)
@@ -1470,7 +1487,8 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             sum(batch["labels"].numel() - count_tail_padding(batch["labels"]) for batch in batches),
             dtype=torch.long,
         )
-        num_tokens_in_batch = self._dp_allreduce(num_tokens_in_batch).item()
+        with torch.profiler.record_function("total num batch tokens"):
+            num_tokens_in_batch = self._dp_allreduce(num_tokens_in_batch).item()
 
         prepare_for_grad_accumulation(self.model_parts, pp_enabled=self.pp_enabled)
 
@@ -1478,9 +1496,10 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             if i == num_batches - 1:
                 prepare_for_final_backward(self.model_parts, pp_enabled=self.pp_enabled)
 
-            self._forward_backward_step(
-                i, batch, loss_buffer=loss_buffer, num_label_tokens=num_label_tokens, num_batches=num_batches
-            )
+            with torch.profiler.record_function("fwd bwd step"):
+                self._forward_backward_step(
+                    i, batch, loss_buffer=loss_buffer, num_label_tokens=num_label_tokens, num_batches=num_batches
+                )
 
             if i == 0:
                 prepare_after_first_microbatch()

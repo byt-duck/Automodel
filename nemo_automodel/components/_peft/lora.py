@@ -405,26 +405,27 @@ class TritonLinearLoRA(LinearLoRA):
         # If LinearLoRA is used to monkey-patch a nn.Linear module, we want to use nn.Linear's
         # forward in the case where it uses quantized weights. We store a reference to nn.Linear's
         # forward in `super_fwd` attribute. If the attribute does not exist we do the usual linear.
-        if (fwd := getattr(self, "super_fwd", None)) is not None:
-            assert fwd != self.forward
-            res = fwd(x)
-        else:
-            res = F.linear(x, self.weight, self.bias)
+        with torch.profiler.record_function("triton lora fwd"):
+            if (fwd := getattr(self, "super_fwd", None)) is not None:
+                assert fwd != self.forward
+                res = fwd(x)
+            else:
+                res = F.linear(x, self.weight, self.bias)
 
-        if self.dropout_position == "pre":
-            x = F.dropout(x, p=self.dropout_p, training=self.training)
-        if self.use_memory_efficient_lora:
-            if self.dropout_position == "pre" or not self.training or self.dropout_p == 0.0:
-                return apply_memory_efficient_lora(x, self.lora_A.weight, self.lora_B.weight, self.scale, True, res)
-            lora_res = apply_memory_efficient_lora(x, self.lora_A.weight, self.lora_B.weight, self.scale, True)
-        else:
-            lora_res = self.lora_B(self.lora_A(x) * self.scale)
-        if self.dropout_position == "post":
-            lora_res = F.dropout(lora_res, p=self.dropout_p, training=self.training)
-        if self.use_memory_efficient_lora:
-            return lora_res.add_(res)
+            if self.dropout_position == "pre":
+                x = F.dropout(x, p=self.dropout_p, training=self.training)
+            if self.use_memory_efficient_lora:
+                if self.dropout_position == "pre" or not self.training or self.dropout_p == 0.0:
+                    return apply_memory_efficient_lora(x, self.lora_A.weight, self.lora_B.weight, self.scale, True, res)
+                lora_res = apply_memory_efficient_lora(x, self.lora_A.weight, self.lora_B.weight, self.scale, True)
+            else:
+                lora_res = self.lora_B(self.lora_A(x) * self.scale)
+            if self.dropout_position == "post":
+                lora_res = F.dropout(lora_res, p=self.dropout_p, training=self.training)
+            if self.use_memory_efficient_lora:
+                return lora_res.add_(res)
 
-        return res + lora_res
+            return res + lora_res
 
 
 def patch_linear_module(
@@ -470,9 +471,9 @@ def patch_linear_module(
         (nn.Module): the monkey-patched (nn.Linear + LoRA) nn.Module
     """
     linear_types = [nn.Linear]
-    if HAS_TE:
-        linear_types.append(transformer_engine.pytorch.Linear)
-        use_triton = False
+    # if HAS_TE:
+    #     linear_types.append(transformer_engine.pytorch.Linear)
+    #     use_triton = False
     if not isinstance(orig_linear, tuple(linear_types)):
         raise NotImplementedError("Expected isinstance(orig_linear, nn.Linear)")
     assert not hasattr(orig_linear, "super_fwd"), orig_linear.super_fwd
