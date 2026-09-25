@@ -43,6 +43,8 @@ _HAS_MLFLOW, mlflow = safe_import(
 )
 import torch
 import torch.nn as nn
+import torch.cuda.profiler as nsight_profiler
+import torch.cuda.nvtx as nvtx
 
 _HAS_WANDB, wandb = safe_import(
     "wandb", msg="wandb is not installed. To enable W&B experiment tracking, run: uv add nemo-automodel[wandb]"
@@ -121,6 +123,8 @@ from nemo_automodel.shared.te_patches import apply_te_patches
 if TYPE_CHECKING:
     from torch.optim import Optimizer
 
+NSIGHT_START = 6
+NSIGHT_STOP = 8
 
 logger = logging.getLogger(__name__)
 
@@ -709,7 +713,6 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         # Build components
         self.peft_config = None
         if self.cfg.get("peft", None) is not None:
-            self.printf("we are doing peft")
             self.peft_config = self.cfg.peft.instantiate()
 
         # Checkpoint config (model-derived fields are filled in by RecipeConfig)
@@ -1121,12 +1124,18 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                     # The step scheduler yields a list of batches with the following properties:
                     # 1. len(batches) == grad_acc_steps
                     # 2. len(batches[0]) == batch_size
-                    for batches in self.step_scheduler:
+                    for it_num, batches in enumerate(self.step_scheduler):
+                        
+                        if it_num == NSIGHT_START:
+                            nsight_profiler.start()
+
                         # If QAT delayed fake-quant is configured, enable after threshold
                         self._enable_qat_if_delayed(self.step_scheduler.step)
 
                         with torch.profiler.record_function("training step"):
+                            nvtx.range_push("training step")
                             train_log_data = self._run_train_optim_step(batches, self.max_grad_norm)
+                            nvtx.range_pop()
                         # Capture outside the microbatch loop and only after the
                         # eager optimizer step has completed. This leaves no
                         # pending checkpoint recomputation or GA backward work.
@@ -1181,14 +1190,17 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                                 best_metric_key=self.best_metric_key,
                             )
                         self._maybe_collect_garbage()
+
+                        if it_num == NSIGHT_STOP:
+                            nsight_profiler.stop()
             
             # torch.cuda.synchronize()
             # if rank == 0:
-            #     trace_path = f"{trace_dir}/nemo-hellaswag-ft.json"
-            #     table_path = f"{trace_dir}/nemo-hellaswag-ft.txt"
+            #     trace_path = f"{trace_dir}/nemo_triton_peft_hellaswag-ft.json"
+            #     table_path = f"{trace_dir}/nemo_triton_peft_hellaswag-ft.txt"
             #     prof.export_chrome_trace(trace_path)
             #     with open(table_path, "w") as f:
-            #         f.write(prof.key_averages().table(sort_by="cuda_time_total", row_limit=15))
+            #         f.write(prof.key_averages().table(sort_by="cuda_time_total", row_limit=30))
                 
 
         finally:
@@ -1285,7 +1297,6 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         fp8_ctx = self.te_fp8.maybe_te_autocast() if self.te_fp8 is not None else nullcontext()
 
         if self.pp_enabled:
-            self.printf("pp is enabled")
             with train_ctx(), fp8_ctx:
                 losses = [] if self.pp.info.has_last_stage else None
                 if self.pp.info.has_last_stage:
@@ -1497,14 +1508,18 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                 prepare_for_final_backward(self.model_parts, pp_enabled=self.pp_enabled)
 
             with torch.profiler.record_function("fwd bwd step"):
+                nvtx.range_push("fwd bwd step")
                 self._forward_backward_step(
                     i, batch, loss_buffer=loss_buffer, num_label_tokens=num_label_tokens, num_batches=num_batches
                 )
+                nvtx.range_pop()
 
             if i == 0:
                 prepare_after_first_microbatch()
-
-        synchronize_tp_replica_gradients(self.model_parts, self.device_mesh)
+        with torch.profiler.record_function("sync tp grads"):
+            nvtx.range_push("sync tp grads")
+            synchronize_tp_replica_gradients(self.model_parts, self.device_mesh)
+            nvtx.range_pop()
         grad_norm = scale_grads_and_clip_grad_norm(
             max_grad_norm,
             self.model_parts,
