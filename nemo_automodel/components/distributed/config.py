@@ -319,8 +319,8 @@ class FSDP2Config:
     reshard_after_forward: bool | None = None
     enable_async_tensor_parallel: bool = False
     enable_compile: bool = False
-    enable_fsdp2_prefetch: bool = False
-    fsdp2_backward_prefetch_depth: int = 2
+    enable_fsdp2_prefetch: bool = True 
+    fsdp2_backward_prefetch_depth: int = 2 #(duck) maybe change, not sure...
     fsdp2_forward_prefetch_depth: int = 1
     multimodal: MultimodalDistributedConfig = field(default_factory=MultimodalDistributedConfig)
 

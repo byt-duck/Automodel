@@ -313,11 +313,11 @@ def _create_fsdp2_device_mesh(
             "since DDP usecase is not supported by FSDP2"
         )
 
-    non_pp_size = dp_size * cp_size * tp_size
+    non_pp_size = dp_size * cp_size * tp_size # 8
     if non_pp_size % ep_size != 0:
         raise ValueError(f"{non_pp_size=} must be a multiple of {ep_size=}")
-    ep_shard_size = non_pp_size // ep_size if ep_size < non_pp_size else 1
-    dp_shard_size = dp_size // dp_replicate_size
+    ep_shard_size = non_pp_size // ep_size if ep_size < non_pp_size else 1 # 2
+    dp_shard_size = dp_size // dp_replicate_size # 8
 
     device_mesh = _init_named_mesh(
         _MeshSpec(

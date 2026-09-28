@@ -356,18 +356,18 @@ def create_distributed_setup_from_config(
     from nemo_automodel.components.distributed.init_utils import get_world_size_safe
 
     if world_size is None:
-        world_size = get_world_size_safe()
+        world_size = get_world_size_safe() # 8
 
     cfg_dict = _distributed_cfg_to_dict(cfg)
 
     explicit_overrides = {
-        "strategy": strategy,
-        "dp_size": dp_size,
-        "dp_replicate_size": dp_replicate_size,
-        "tp_size": tp_size,
-        "pp_size": pp_size,
-        "cp_size": cp_size,
-        "ep_size": ep_size,
+        "strategy": strategy, # fsdp2
+        "dp_size": dp_size, # None
+        "dp_replicate_size": dp_replicate_size, # None
+        "tp_size": tp_size, # 1
+        "pp_size": pp_size, # None
+        "cp_size": cp_size, # 1
+        "ep_size": ep_size, # 4
         "pipeline": pipeline,
         "moe": moe,
     }

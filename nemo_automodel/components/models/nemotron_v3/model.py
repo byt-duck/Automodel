@@ -268,13 +268,14 @@ class NemotronV3Model(nn.Module):
                 # MLP/MoE layers don't use mask
                 mask = None
 
-            hidden_states = layer(
-                hidden_states,
-                attention_mask=mask,
-                past_key_values=past_key_values,
-                cache_position=cache_position,
-                **kwargs,
-            )
+            with torch.profiler.record_function(f"{layer.block_type} layer forward"):
+                hidden_states = layer(
+                    hidden_states,
+                    attention_mask=mask,
+                    past_key_values=past_key_values,
+                    cache_position=cache_position,
+                    **kwargs,
+                )
 
         # Norm is None on non-last PP stages (splitter trims it).
         if getattr(self, "norm", None) is not None:
@@ -805,7 +806,7 @@ class NemotronHForCausalLM(HFCheckpointingMixin, GenerationMixin, nn.Module, MoE
         is_pp_stage = self._is_pipeline_parallel_stage()
         is_first_stage = getattr(self.model, "embed_tokens", None) is not None
         has_lm_head = self.lm_head is not None
-        mtp_depth = int(getattr(self.mtp_config, "num_layers", 0) or 0)
+        mtp_depth = int(getattr(self.mtp_config, "num_layers", 0) or 0) # multi-token prediction head
         pp_mtp_enabled = is_pp_stage and self.mtp_config.enabled
         # CP shards are not contiguous sequence slices. MTP therefore cannot
         # derive future-token embeddings or positions by rolling rank-local
@@ -871,15 +872,17 @@ class NemotronHForCausalLM(HFCheckpointingMixin, GenerationMixin, nn.Module, MoE
 
         # On non-first PP stages, the upstream hidden-state tensor arrives in
         # the input_ids slot; the inner model routes it via inputs_embeds.
-        hidden_states = self.model(
-            input_ids,
-            attention_mask=attention_mask,
-            causal_mask_mapping=causal_mask_mapping,
-            inputs_embeds=inputs_embeds,
-            past_key_values=past_key_values,
-            cache_position=cache_position,
-            **kwargs,
-        )
+
+        with torch.profiler.record_function("root model fwd"):
+            hidden_states = self.model(
+                input_ids,
+                attention_mask=attention_mask,
+                causal_mask_mapping=causal_mask_mapping,
+                inputs_embeds=inputs_embeds,
+                past_key_values=past_key_values,
+                cache_position=cache_position,
+                **kwargs,
+            )
 
         # Root forward has run; FSDP2 lazy-init is satisfied. Build MTP embed
         # tuple from pre-squeeze [B, S] ids so emitted shapes match

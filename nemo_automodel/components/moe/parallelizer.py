@@ -371,7 +371,7 @@ def apply_ep(model: nn.Module, ep_mesh: DeviceMesh, moe_mesh: DeviceMesh | None 
                 module=moe_module.experts,
                 device_mesh=ep_mesh,
                 parallelize_plan=ExpertParallel(),
-            )
+            ) # we're sharding MOE over EP group
 
 
 # Alias of the shared tower taxonomy. Previously a private copy that had drifted
@@ -769,6 +769,10 @@ def apply_fsdp(
     lm_head_precision: str | torch.dtype | None = None,
     wrap_outer_model: bool = True,
     frozen_multimodal_sharding: FrozenMultimodalSharding = "root",
+
+    enable_fsdp2_prefetch: bool = False,
+    fsdp2_backward_prefetch_depth: int = 2,
+    fsdp2_forward_prefetch_depth: int = 1,
 ) -> None:
     """Apply FSDP wrapping to MoE transformer blocks and model-level modules."""
     frozen_multimodal_sharding = normalize_frozen_multimodal_sharding(frozen_multimodal_sharding)
@@ -885,6 +889,7 @@ def apply_fsdp(
     if mtp_module is not None and hasattr(mtp_module, "layers"):
         mtp_block_ids = {id(b) for b in mtp_module.layers.children()}
 
+    # (duck): EP owns sharding on expert dim, FSDP owns sharding on weight-dim in expert partition group...
     for block in _iter_moe_blocks(model, _model):
         moe_module = _get_moe_module(block)
         gate = getattr(moe_module, "gate", None)
@@ -911,6 +916,10 @@ def apply_fsdp(
             # by BF16 GMM / TE kernels). Experts are an internal FSDP boundary, so
             # their policy does not override the activation dtype returned to the
             # rest of the block.
+
+            # (duck) meaning? weight.shape = [num_experts, weight_dim,...] -> (nemotron nano) where we've already sharded 128 by 4 -> 32
+            # now 2 rank ep-shard group must split this tensor between two ranks...default is to split along dim=0, but not safe here...
+            # why? (local experts / shard) if local_experts < shards -> unstable behavior...so we split along dim=1 instead
             fully_shard(
                 moe_module.experts,
                 mesh=ep_shard_mesh,
@@ -943,6 +952,20 @@ def apply_fsdp(
             ignored_params=ignored_params or None,
             fully_shard_fn=fully_shard_impl,
         )
+
+    # (duck): just forward prefetch mamba -> attention
+    if enable_fsdp2_prefetch and fsdp2_forward_prefetch_depth > 0:
+        blocks = list(_iter_moe_blocks(model, _model))
+        for block_index, block in enumerate(blocks[:-1]):
+            if getattr(block, "layer_type", None) != "mamba":
+                continue
+            prefetch_targets = [
+                target
+                for target in blocks[block_index + 1 : block_index + 1 + fsdp2_forward_prefetch_depth]
+                if getattr(target, "layer_type", None) == "full_attention"
+            ]
+            if prefetch_targets:
+                block.set_modules_to_forward_prefetch(prefetch_targets)
 
     # Re-establish weight tying before detecting it: a device/dtype move during
     # from_pretrained (HF replaces param tensors) can silently break a tie set in
@@ -1156,6 +1179,10 @@ def parallelize_model(
     enable_async_tensor_parallel: bool = False,
     frozen_multimodal_sharding: FrozenMultimodalSharding = "root",
     reapply_trainability: Callable[[nn.Module], None] | None = None,
+
+    enable_fsdp2_prefetch: bool = False,
+    fsdp2_backward_prefetch_depth: int = 2, # (duck) not sure if this matters if reshard_after_forward=False?
+    fsdp2_forward_prefetch_depth: int = 1,
 ) -> None:
     """Apply tensor, context, expert, activation-checkpointing, and FSDP parallelism.
 
@@ -1218,6 +1245,7 @@ def parallelize_model(
             f"expert_parallel_degree {moe_mesh[ep_axis_name].size()}"
         )
 
+        # (duck): TODO prefetching for ep layers...
         apply_ep(model, moe_mesh[ep_axis_name], moe_mesh=moe_mesh)
 
     if activation_checkpointing:
@@ -1259,6 +1287,10 @@ def parallelize_model(
             lm_head_precision=lm_head_precision,
             wrap_outer_model=wrap_outer_model,
             frozen_multimodal_sharding=frozen_multimodal_sharding,
+
+            enable_fsdp2_prefetch=enable_fsdp2_prefetch,
+            fsdp2_backward_prefetch_depth=fsdp2_backward_prefetch_depth,
+            fsdp2_forward_prefetch_depth=fsdp2_forward_prefetch_depth,
         )
         if cp_enabled:
             configured_units = parallelizer_utils.configure_fsdp_unused_param_reduction(model)

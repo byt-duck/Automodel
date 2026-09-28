@@ -1148,7 +1148,6 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                         self.log_train_metrics(train_log_data)
                         self._update_progress_bar(pbar, train_log_data.metrics)
 
-                        prof.step()
 
                         # Run validation every val_every_steps
                         val_losses = {}
@@ -1180,6 +1179,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                             for mp in self.model_parts:
                                 mp.train()
 
+
                         # Save the checkpoint every ckpt_every_steps
                         if self.step_scheduler.is_ckpt_step:
                             self.save_checkpoint(
@@ -1191,16 +1191,18 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                             )
                         self._maybe_collect_garbage()
 
+                        prof.step()
+
                         if it_num == NSIGHT_STOP:
                             nsight_profiler.stop()
             
-            # torch.cuda.synchronize()
-            # if rank == 0:
-            #     trace_path = f"{trace_dir}/nemo_triton_peft_hellaswag-ft.json"
-            #     table_path = f"{trace_dir}/nemo_triton_peft_hellaswag-ft.txt"
-            #     prof.export_chrome_trace(trace_path)
-            #     with open(table_path, "w") as f:
-            #         f.write(prof.key_averages().table(sort_by="cuda_time_total", row_limit=30))
+            torch.cuda.synchronize()
+            if rank == 0:
+                trace_path = f"{trace_dir}/ma_prefetch_nemo_triton_peft_hellaswag-ft.json"
+                table_path = f"{trace_dir}/ma_prefetch_nemo_triton_peft_hellaswag-ft.txt"
+                prof.export_chrome_trace(trace_path)
+                with open(table_path, "w") as f:
+                    f.write(prof.key_averages().table(sort_by="cuda_time_total", row_limit=30))
                 
 
         finally:
@@ -1365,7 +1367,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                         )
                 else:
                     # nemotron peft -> should be using masked ce
-                    with torch.profiler.record_function("model fwd pass"):
+                    with torch.profiler.record_function("causal lm fwd pass"):
                         out = model(**batch)
 
                 # Gather the LM head once and share it across the main loss and

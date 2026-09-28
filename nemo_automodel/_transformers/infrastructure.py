@@ -427,6 +427,12 @@ def instantiate_infrastructure(
                 "frozen_multimodal_sharding",
                 model_wrapper.frozen_multimodal_sharding,
             )
+
+            # prefetching 
+            moe_kwargs.setdefault("enable_fsdp2_prefetch", model_wrapper.enable_fsdp2_prefetch)
+            moe_kwargs.setdefault("fsdp2_backward_prefetch_depth", model_wrapper.fsdp2_backward_prefetch_depth)
+            moe_kwargs.setdefault("fsdp2_forward_prefetch_depth", model_wrapper.fsdp2_forward_prefetch_depth)
+
         parallelize_fn = partial(
             parallelize_model,
             activation_checkpointing=activation_checkpointing,
@@ -617,6 +623,9 @@ def apply_model_infrastructure(
     # Skip load-before-shard for PEFT: base load into unwrapped PEFT then later adapter load
     # after shard can leave base/adapter out of sync (e.g. key/device mismatch). Use the
     # post-shard load path so base and adapter load in the same way as multi-GPU.
+
+    # (duck) meaning? if we load base model weights before sharing, and lora weights after sharding
+    # there's a chance something can go wrong -> load after shard
     need_checkpoint_load = bool(pretrained_model_name_or_path and load_base_model)
     load_before_shard = _should_load_before_shard(
         autopipeline=autopipeline,
