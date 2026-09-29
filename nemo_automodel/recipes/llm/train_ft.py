@@ -1198,8 +1198,8 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             
             torch.cuda.synchronize()
             if rank == 0:
-                trace_path = f"{trace_dir}/ma_prefetch_nemo_triton_peft_hellaswag-ft.json"
-                table_path = f"{trace_dir}/ma_prefetch_nemo_triton_peft_hellaswag-ft.txt"
+                trace_path = f"{trace_dir}/full_prefetch_nemo_triton_peft_hellaswag-ft.json"
+                table_path = f"{trace_dir}/full_prefetch_nemo_triton_peft_hellaswag-ft.txt"
                 prof.export_chrome_trace(trace_path)
                 with open(table_path, "w") as f:
                     f.write(prof.key_averages().table(sort_by="cuda_time_total", row_limit=30))

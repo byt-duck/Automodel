@@ -531,7 +531,7 @@ class GroupedExperts(nn.Module):
             # Exchange per-rank token counts
             local_len_t = torch.tensor([local_num_tokens], device=x.device, dtype=torch.int64)
             gathered_len_t = [torch.zeros_like(local_len_t) for _ in range(ep_size)]
-            dist.all_gather(gathered_len_t, local_len_t, group=ep_group)
+            dist.all_gather(gathered_len_t, local_len_t, group=ep_group) # all-gathers token-side tensors
             gathered_lens = [int(t.item()) for t in gathered_len_t]
             max_len = max(gathered_lens)
 

@@ -371,7 +371,7 @@ def apply_ep(model: nn.Module, ep_mesh: DeviceMesh, moe_mesh: DeviceMesh | None 
                 module=moe_module.experts,
                 device_mesh=ep_mesh,
                 parallelize_plan=ExpertParallel(),
-            ) # we're sharding MOE over EP group
+            )  # (duck) we're sharding MOE over EP group
 
 
 # Alias of the shared tower taxonomy. Previously a private copy that had drifted
@@ -769,7 +769,6 @@ def apply_fsdp(
     lm_head_precision: str | torch.dtype | None = None,
     wrap_outer_model: bool = True,
     frozen_multimodal_sharding: FrozenMultimodalSharding = "root",
-
     enable_fsdp2_prefetch: bool = False,
     fsdp2_backward_prefetch_depth: int = 2,
     fsdp2_forward_prefetch_depth: int = 1,
@@ -889,8 +888,12 @@ def apply_fsdp(
     if mtp_module is not None and hasattr(mtp_module, "layers"):
         mtp_block_ids = {id(b) for b in mtp_module.layers.children()}
 
-    # (duck): EP owns sharding on expert dim, FSDP owns sharding on weight-dim in expert partition group...
+    # Record each block's FSDP units in bottom-up wrapping order. Reversing one
+    # block's list gives its forward execution order (outer block before nested
+    # dtype-specific or expert units), which is the order manual prefetch expects.
+    model_fsdp_modules: list[list[nn.Module]] = []
     for block in _iter_moe_blocks(model, _model):
+        block_fsdp_modules: list[nn.Module] = []
         moe_module = _get_moe_module(block)
         gate = getattr(moe_module, "gate", None)
         if isinstance(gate, Gate) and gate.e_score_correction_bias is not None:
@@ -928,6 +931,8 @@ def apply_fsdp(
                 mp_policy=experts_mp_policy,
                 offload_policy=offload_policy,
             )
+            block_fsdp_modules.append(moe_module.experts)
+
         # If FSDP is disabled for grouped experts because the parameters are already
         # fully sharded by PP and EP, then we need to explicitly remove the parameters
         # from FSDP for the transformer block.
@@ -940,6 +945,10 @@ def apply_fsdp(
         if externally_sharded_params:
             ignored_params.update(externally_sharded_params.intersection(block.parameters()))
 
+        def fully_shard_and_record(module: nn.Module, **kwargs) -> None:
+            fully_shard_impl(module, **kwargs)
+            block_fsdp_modules.append(module)
+
         # Reuse the dense dtype-aware path for model-owned fp32 contracts while
         # leaving EP-owned experts out of the block's dtype and FSDP ownership.
         parallelizer_utils.fully_shard_by_dtype(
@@ -950,22 +959,25 @@ def apply_fsdp(
             fp32_compute_module_names=fp32_compute_module_names,
             reshard_after_forward=reshard_after_forward,
             ignored_params=ignored_params or None,
-            fully_shard_fn=fully_shard_impl,
+            fully_shard_fn=fully_shard_and_record,
         )
+        model_fsdp_modules.append(block_fsdp_modules)
 
-    # (duck): just forward prefetch mamba -> attention
-    if enable_fsdp2_prefetch and fsdp2_forward_prefetch_depth > 0:
-        blocks = list(_iter_moe_blocks(model, _model))
-        for block_index, block in enumerate(blocks[:-1]):
-            if getattr(block, "layer_type", None) != "mamba":
-                continue
-            prefetch_targets = [
-                target
-                for target in blocks[block_index + 1 : block_index + 1 + fsdp2_forward_prefetch_depth]
-                if getattr(target, "layer_type", None) == "full_attention"
-            ]
-            if prefetch_targets:
-                block.set_modules_to_forward_prefetch(prefetch_targets)
+    # (duck): fspd + ep prefetching
+    if enable_fsdp2_prefetch:
+        if fsdp2_forward_prefetch_depth > 0:
+            for block_index, block_fsdp_modules in enumerate(model_fsdp_modules[:-1]):
+                if not block_fsdp_modules:
+                    continue
+                prefetch_targets = [
+                    fsdp_module
+                    for next_block_modules in model_fsdp_modules[
+                        block_index + 1 : block_index + 1 + fsdp2_forward_prefetch_depth
+                    ]
+                    for fsdp_module in reversed(next_block_modules)
+                ]
+                if prefetch_targets:
+                    block_fsdp_modules[-1].set_modules_to_forward_prefetch(prefetch_targets)
 
     # Re-establish weight tying before detecting it: a device/dtype move during
     # from_pretrained (HF replaces param tensors) can silently break a tie set in
@@ -1179,9 +1191,8 @@ def parallelize_model(
     enable_async_tensor_parallel: bool = False,
     frozen_multimodal_sharding: FrozenMultimodalSharding = "root",
     reapply_trainability: Callable[[nn.Module], None] | None = None,
-
     enable_fsdp2_prefetch: bool = False,
-    fsdp2_backward_prefetch_depth: int = 2, # (duck) not sure if this matters if reshard_after_forward=False?
+    fsdp2_backward_prefetch_depth: int = 2,  # (duck) not sure if this matters if reshard_after_forward=False?
     fsdp2_forward_prefetch_depth: int = 1,
 ) -> None:
     """Apply tensor, context, expert, activation-checkpointing, and FSDP parallelism.
@@ -1287,7 +1298,6 @@ def parallelize_model(
             lm_head_precision=lm_head_precision,
             wrap_outer_model=wrap_outer_model,
             frozen_multimodal_sharding=frozen_multimodal_sharding,
-
             enable_fsdp2_prefetch=enable_fsdp2_prefetch,
             fsdp2_backward_prefetch_depth=fsdp2_backward_prefetch_depth,
             fsdp2_forward_prefetch_depth=fsdp2_forward_prefetch_depth,
