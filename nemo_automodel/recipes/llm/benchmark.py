@@ -14,7 +14,9 @@
 
 import json
 import logging
+import os
 import pathlib
+from contextlib import nullcontext
 
 import torch
 
@@ -321,116 +323,152 @@ class BenchmarkingRecipeForNextTokenPrediction(TrainFinetuneRecipeForNextTokenPr
         # Create dataloader iterator
         dataloader_iter = iter(self.dataloader)
 
+        profile_dir_text = os.environ.get("AUTOMODEL_TORCH_PROFILE_DIR")
+        profile_dir = pathlib.Path(profile_dir_text) if profile_dir_text else None
+        if profile_dir is not None:
+            profile_dir.mkdir(parents=True, exist_ok=True)
+            profile_wait = max(warmup_steps - 2, 0)
+            profile_warmup = min(warmup_steps, 2)
+            profiler_context = torch.profiler.profile(
+                activities=[
+                    torch.profiler.ProfilerActivity.CPU,
+                    torch.profiler.ProfilerActivity.CUDA,
+                ],
+                schedule=torch.profiler.schedule(
+                    wait=profile_wait,
+                    warmup=profile_warmup,
+                    active=3,
+                    repeat=1,
+                ),
+                record_shapes=False,
+                profile_memory=False,
+                with_stack=False,
+            )
+        else:
+            profiler_context = nullcontext()
+
+        self._bench_losses = []
+        torch.cuda.reset_peak_memory_stats()
+
         # Main benchmarking loop
-        for i in range(steps):
-            self.step_scheduler.step = i
-            # Start nsys profiling if configured
-            if i == nsys_start and rank in nsys_ranks:
-                logger.info(f"Rank {rank} | Starting nsys profiling")
-                torch.cuda.cudart().cudaProfilerStart()
-                # Per-microbatch NVTX ranges below already delimit the work.
-                # Entering emit_nvtx() without closing it leaks RecordFunction
-                # callbacks into later DTensor/FSDP operations.
+        with profiler_context as profiler:
+            for i in range(steps):
+                self.step_scheduler.step = i
+                # Start nsys profiling if configured
+                if i == nsys_start and rank in nsys_ranks:
+                    logger.info(f"Rank {rank} | Starting nsys profiling")
+                    torch.cuda.cudart().cudaProfilerStart()
+                    # Per-microbatch NVTX ranges below already delimit the work.
+                    # Entering emit_nvtx() without closing it leaks RecordFunction
+                    # callbacks into later DTensor/FSDP operations.
 
-            if rank == 0:
-                logger.info(f"Rank {rank} | Iteration {i}")
+                if rank == 0:
+                    logger.info(f"Rank {rank} | Iteration {i}")
 
-            # Zero gradients
-            for opt in self.optimizer:
-                opt.zero_grad()
+                # Zero gradients
+                for opt in self.optimizer:
+                    opt.zero_grad()
 
-            # Time the iteration
-            iter_timer = "iteration_warmup" if i < warmup_steps else "iteration"
-            with self.timers(iter_timer, log_level=1):
-                # Gradient accumulation loop
-                num_label_tokens = 0
-                loss_buffer = []
-                prepare_for_grad_accumulation(self.model_parts, pp_enabled=self.pp_enabled)
+                # Time the iteration
+                iter_timer = "iteration_warmup" if i < warmup_steps else "iteration"
+                with self.timers(iter_timer, log_level=1):
+                    # Gradient accumulation loop
+                    num_label_tokens = 0
+                    loss_buffer = []
+                    prepare_for_grad_accumulation(self.model_parts, pp_enabled=self.pp_enabled)
 
-                for ga_step_idx in range(ga_steps):
-                    if ga_step_idx == ga_steps - 1:
-                        prepare_for_final_backward(self.model_parts, pp_enabled=self.pp_enabled)
+                    for ga_step_idx in range(ga_steps):
+                        if ga_step_idx == ga_steps - 1:
+                            prepare_for_final_backward(self.model_parts, pp_enabled=self.pp_enabled)
 
-                    # Get batch from dataloader
-                    batch = next(dataloader_iter)
-                    torch.cuda.nvtx.range_push(f"iteration_{i}_ga_step_{ga_step_idx}")
+                        # Get batch from dataloader
+                        batch = next(dataloader_iter)
+                        torch.cuda.nvtx.range_push(f"iteration_{i}_ga_step_{ga_step_idx}")
 
-                    # Accumulate label tokens locally
-                    num_label_tokens += (batch["labels"] != -100).sum().item()
+                        # Accumulate label tokens locally
+                        num_label_tokens += (batch["labels"] != -100).sum().item()
 
-                    with self.timers(f"forward_backward_{ga_step_idx}", log_level=2):
-                        self._forward_backward_step(
-                            ga_step_idx,
-                            batch,
-                            loss_buffer=loss_buffer,
-                            num_label_tokens=None,
-                            num_batches=ga_steps,
-                            is_train=True,
-                        )
+                        with self.timers(f"forward_backward_{ga_step_idx}", log_level=2):
+                            self._forward_backward_step(
+                                ga_step_idx,
+                                batch,
+                                loss_buffer=loss_buffer,
+                                num_label_tokens=None,
+                                num_batches=ga_steps,
+                                is_train=True,
+                            )
 
-                    torch.cuda.nvtx.range_pop()
+                        torch.cuda.nvtx.range_pop()
 
-                    if ga_step_idx == 0:
-                        prepare_after_first_microbatch()
+                        if ga_step_idx == 0:
+                            prepare_after_first_microbatch()
 
-                # Optimizer step
-                with self.timers("optimizer", log_level=2):
-                    synchronize_tp_replica_gradients(self.model_parts, self.device_mesh)
-                    for opt in self.optimizer:
-                        opt.step()
-                    logger.debug("Optimizer step")
+                    # Optimizer step
+                    with self.timers("optimizer", log_level=2):
+                        synchronize_tp_replica_gradients(self.model_parts, self.device_mesh)
+                        for opt in self.optimizer:
+                            opt.step()
+                        logger.debug("Optimizer step")
 
-            # Match the training-loop lifecycle: record one complete eager
-            # optimizer step, then capture outside the measured iteration.
-            if self.partial_cuda_graph_manager is not None and self._partial_cuda_graph_capture_pending:
-                self.partial_cuda_graph_manager.capture()
-                self._partial_cuda_graph_capture_pending = False
+                # Match the training-loop lifecycle: record one complete eager
+                # optimizer step, then capture outside the measured iteration.
+                if self.partial_cuda_graph_manager is not None and self._partial_cuda_graph_capture_pending:
+                    self.partial_cuda_graph_manager.capture()
+                    self._partial_cuda_graph_capture_pending = False
 
-            # Synchronize num_label_tokens across DP ranks
-            num_label_tokens_tensor = torch.tensor(num_label_tokens, dtype=torch.long, device=device)
-            num_label_tokens_tensor = self._dp_allreduce(num_label_tokens_tensor)
-            num_label_tokens = num_label_tokens_tensor.item()
+                # Synchronize num_label_tokens across DP ranks
+                num_label_tokens_tensor = torch.tensor(num_label_tokens, dtype=torch.long, device=device)
+                num_label_tokens_tensor = self._dp_allreduce(num_label_tokens_tensor)
+                num_label_tokens = num_label_tokens_tensor.item()
 
-            # Calculate loss - following exact train_ft.py:1059-1071 pattern
-            reporting_loss = torch.sum(torch.stack(loss_buffer))
-            reporting_loss = self._dp_allreduce(reporting_loss, include_cp=True)
-            reporting_loss = reporting_loss.to(torch.float32) / num_label_tokens
+                # Calculate loss - following exact train_ft.py:1059-1071 pattern
+                reporting_loss = torch.sum(torch.stack(loss_buffer))
+                reporting_loss = self._dp_allreduce(reporting_loss, include_cp=True)
+                reporting_loss = reporting_loss.to(torch.float32) / num_label_tokens
 
-            if self.pp_enabled:
-                reporting_loss = reporting_loss.to(self.dist_env.device)
-                # Send loss to first rank if pp group rank is 0
-                src_rank = self.device_mesh.mesh.reshape(-1)[-1].item()
-                if self.dist_env.rank == src_rank:
-                    torch.distributed.send(reporting_loss, dst=0)
-                elif self.dist_env.is_main:
-                    torch.distributed.recv(reporting_loss, src=src_rank)
+                if self.pp_enabled:
+                    reporting_loss = reporting_loss.to(self.dist_env.device)
+                    # Send loss to first rank if pp group rank is 0
+                    src_rank = self.device_mesh.mesh.reshape(-1)[-1].item()
+                    if self.dist_env.rank == src_rank:
+                        torch.distributed.send(reporting_loss, dst=0)
+                    elif self.dist_env.is_main:
+                        torch.distributed.recv(reporting_loss, src=src_rank)
 
-            reporting_loss = reporting_loss.cpu().item()
+                reporting_loss = reporting_loss.cpu().item()
+                if rank == 0:
+                    self._bench_losses.append(reporting_loss)
+                    print(f"num_label_tokens={num_label_tokens} | loss={reporting_loss:.4f}")
+                    logger.info(
+                        f"Rank {rank} | Iteration {i} | num_label_tokens={num_label_tokens} | "
+                        f"Max Memory Allocated: {torch.cuda.max_memory_allocated() / 1024**3:.2f} GB | "
+                        f"loss={reporting_loss:.4f}"
+                    )
+                    if self._wandb_enabled and self.wandb_run is not None:
+                        self.wandb_run.log({"loss": reporting_loss}, step=i)
 
-            if rank == 0:
-                print(f"num_label_tokens={num_label_tokens} | loss={reporting_loss:.4f}")
-                logger.info(
-                    f"Rank {rank} | Iteration {i} | num_label_tokens={num_label_tokens} | "
-                    f"Max Memory Allocated: {torch.cuda.max_memory_allocated() / 1024**3:.2f} GB | "
-                    f"loss={reporting_loss:.4f}"
-                )
+                # Collect and log MoE load balance metrics (inherited from train_ft)
+                self._collect_moe_load_balance()
                 if self._wandb_enabled and self.wandb_run is not None:
-                    self.wandb_run.log({"loss": reporting_loss}, step=i)
+                    self._log_moe_metrics(i, self.wandb_run.log)
 
-            # Collect and log MoE load balance metrics (inherited from train_ft)
-            self._collect_moe_load_balance()
-            if self._wandb_enabled and self.wandb_run is not None:
-                self._log_moe_metrics(i, self.wandb_run.log)
+                # Calculate and log MFU
+                self._log_iteration_metrics(iter_timer, ga_steps, peak_tflops, rank, i)
 
-            # Calculate and log MFU
-            self._log_iteration_metrics(iter_timer, ga_steps, peak_tflops, rank, i)
+                # Stop nsys profiling if configured
+                if i == nsys_end and rank in nsys_ranks:
+                    logger.info(f"Rank {rank} | Stopping nsys profiling")
+                    torch.cuda.cudart().cudaProfilerStop()
 
-            # Stop nsys profiling if configured
-            if i == nsys_end and rank in nsys_ranks:
-                logger.info(f"Rank {rank} | Stopping nsys profiling")
-                torch.cuda.cudart().cudaProfilerStop()
+                self._maybe_collect_garbage()
+                if profiler is not None:
+                    profiler.step()
 
-            self._maybe_collect_garbage()
+        if profiler is not None and rank == 0:
+            profiler.export_chrome_trace(str(profile_dir / "trace-rank0.json"))
+            (profile_dir / "kernels-rank0.txt").write_text(
+                profiler.key_averages().table(sort_by="cuda_time_total", row_limit=50)
+            )
 
         if self.partial_cuda_graph_manager is not None:
             self.partial_cuda_graph_manager.log_stats("benchmark")
@@ -535,6 +573,9 @@ class BenchmarkingRecipeForNextTokenPrediction(TrainFinetuneRecipeForNextTokenPr
                 "global_batch_size": self.cfg.step_scheduler.global_batch_size,
                 "local_batch_size": self.cfg.get("step_scheduler.local_batch_size"),
                 "seq_len": self._bench_seq_len,
+                "losses": self._bench_losses,
+                "peak_allocated_gib": torch.cuda.max_memory_allocated() / 1024**3,
+                "peak_reserved_gib": torch.cuda.max_memory_reserved() / 1024**3,
             }
 
             # Log to wandb as table

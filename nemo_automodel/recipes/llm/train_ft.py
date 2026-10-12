@@ -1361,6 +1361,8 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                 batch = filter_forward_kwargs(model, batch)
                 if isinstance(self.loss_fn, FusedLinearCrossEntropy):
                     # use num_logits_to_keep to avoid full logits matrix in memory
+                    with torch.profiler.record_function("causal lm fwd pass"):
+                        out = model(**{**batch, "logits_to_keep": 1, "output_hidden_states": True})
                     if "hidden_states" not in out:
                         raise ValueError(
                             "FusedLinearCrossEntropy requires the model to output hidden states. Set `model.output_hidden_states=True` in the config."
